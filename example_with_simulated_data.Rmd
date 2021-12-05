@@ -1,0 +1,142 @@
+---
+title: "Example with simulated data"
+author: "Julien Riou"
+date: "04/12/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Setup
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen=1, digits=1)
+source("estimate_rr.R")
+library(tidyverse)
+set.seed(789)
+theme_set(theme_bw())
+```
+
+
+## Simulate vaccination coverage
+
+We start by simulating vaccination coverage for a year following a typical vaccination campaign.
+We consider 5 age groups, and assume that the coverage will be higher in older age groups.
+We also assume that the number of daily vaccinations starts high and decreases with time,
+and scale the coverage so that it ends at 95% in the oldest age group.
+
+```{r sim_cov, fig.width=5}
+WEEKS = 1:52
+AGE_GROUPS = 1:5
+COV_MAX = .95
+coveragedata = expand_grid(week=WEEKS, age_group=AGE_GROUPS) %>% 
+  mutate(coverage=rpois(length(WEEKS)*length(AGE_GROUPS),10*1/week*age_group)) %>% 
+  group_by(age_group) %>% 
+  mutate(coverage=cumsum(coverage),
+         coverage=age_group*coverage/max(coverage)/max(AGE_GROUPS)*COV_MAX)
+```
+
+
+```{r plot_cov, fig.width=5,fig.height=3,fig.align='center',fig.cap="Figure 1. Simulated vaccination coverage in time by age group."}
+ggplot(coveragedata) +
+  geom_line(aes(x=week,y=coverage,colour=factor(age_group))) +
+  labs(colour="age_group") +
+  scale_y_continuous(labels=scales::percent,limits=c(0,1))
+```
+
+## Simulate vaccination status among hospitalized
+
+```{r sim_pars}
+N = 5000
+CHOSEN_RR = 10
+```
+
+We simulate typical surveillance data on hospitalized patients. We generate
+`r N` patients and attribute to each a week of hospitalization and an age group uniformly. 
+Using the coverage data, we link each patient with the vaccination coverage
+at the corresponding time in the corresponding age group.
+
+```{r sim_hosp}
+survdata = tibble(id=1:N,
+                  week=sample(WEEKS,N,replace=TRUE),
+                  age_group=sample(AGE_GROUPS,N,replace=TRUE)) %>% 
+  left_join(coveragedata,by=c("week","age_group"))
+```
+
+We now simulate the expected probability that each patient is vaccinated or not depending on 
+(1) vaccination coverage and (2) a relative risk of hospitalization among non-vaccinated
+compared to vaccinated of `r CHOSEN_RR`. For that we use the following equation:
+$$
+\Pr(V|H) = \frac{\Pr(V)}{\Pr(V) + RR\times(1-\Pr(V))}
+$$
+where $\Pr(V|H)$ is the probability of being vaccinated given hospitalization, $\Pr(V)$ is 
+the probability of being vaccinated in the population (i.e. coverage), and $RR$ is 
+relative risk of hospitalization among non-vaccinated compared to vaccinated ($RR=10$).
+We then draw the actual vaccination status of each individual (`0` for not vaccinated, `1`
+for vaccinated) from a Bernoulli distribution.
+
+```{r sim_vacc}
+survdata = survdata %>% 
+  mutate(expected_vacc=coverage/(coverage+CHOSEN_RR*(1-coverage)),
+         vacc=rbinom(N,size=1,prob=expected_vacc))
+survdata
+```
+
+Aggregating over time, this results in an increasing trend in the proportion of vaccinated
+among hospitalized cases.
+
+```{r plot_vacc, fig.width=5,fig.height=3,fig.align='center',fig.cap="Figure 2. Simulated proportion of vaccinated among hospitalized patients."}
+survdata %>% 
+  dplyr::group_by(week) %>% 
+  dplyr::summarise(prop_vaccinated=mean(vacc)) %>% 
+  ggplot() +
+  geom_line(aes(x=week,y=prop_vaccinated))+
+  scale_y_continuous(labels=scales::percent)
+```
+
+## Estimate vaccine effectiveness
+
+We can then apply the function `estimate_rr()` and directly estimate the $RR$
+of hospitalization among non-vaccinated compared to vaccinated from individual
+data on the vaccination status of hospitalized patients and the vaccine
+coverage corresponding to each patient.
+
+```{r est_rr}
+EST_RR = estimate_rr(vacc=survdata$vacc, coverage=survdata$coverage)
+```
+
+We find a maximum likelihood estimate of `r EST_RR$rr` with a 
+95% confidence interval of `r EST_RR$rr_lower` to  `r EST_RR$rr_upper`.
+This can be compared to the value of `r CHOSEN_RR` used to simulate the data.
+
+```{r plot_rr, fig.width=3,fig.height=3,fig.align='center',fig.cap="Figure 3. Estimated value of the relative risk of hospitalization among non-vaccinated compared to vaccinated compared to the value chosen to simulate the data."}
+as_tibble(EST_RR) %>% 
+  ggplot() +
+  geom_pointrange(aes(x="Estimate",y=rr,ymin=rr_lower,ymax=rr_upper)) +
+  geom_point(aes(x="Chosen value",y=CHOSEN_RR),colour="firebrick") +
+  scale_y_continuous(limits=c(0,CHOSEN_RR*1.2)) +
+  labs(x=NULL)
+```
+
+
+We can transform the $RR$ into a relative risk reduction with $1-1/RR$, resulting
+in estimates of `r (1-1/EST_RR$rr)*100`% with a 95% confidence interval of `r (1-1/EST_RR$rr_lower)*100`% 
+to  `r (1-1/EST_RR$rr_upper)*100`%. With the assumption that the differences between the
+vaccinated and non-vaccinated groups (e.g. in terms of exposure or risk of hospitalization) 
+only come from the vaccination status, this relative risk reduction can be interpreted
+as vaccine effectiveness.
+
+## Extensions
+
+The function `estimate_rr()` allows the estimation of the overall $RR$ of hospitalization for non-vaccinated
+compared to vaccinated. It can be applied to other outcomes, e.g. the $RR$ of death or the $RR$ of confirmed
+case, provided that individual data with vaccination status is reliably collected.
+
+If there are reasons to believe that the $RR$ varies according to individual characteristics (e.g. age or sex),
+it is possible to estimate the variation in $RR$ according to covariates with function `estimate_rr_covariates()`.
+Note that it is necessary to provide the covariates in matrix form. 
+
+If vaccination status includes 3 possibilities instead of 2 (e.g. including several vaccine types or vaccination by time since
+vaccination), then it is possible to estimate the $RR$ for different possibilities with function `estimate_rr_3groups()`.
+It uses an extension of the equation of $\Pr(V|H)$ to obtain $\Pr(V_1|H)$, $\Pr(V_2|H)$ and $\Pr(V_3|H)$ and a categorical 
+distribution instead of Bernoulli (see supplementary appendix). The 3 groups can be for instance not vaccinated, vaccinated
+with vaccine 1 and vaccinated with vaccine 2. Or, restricting only to vaccinated people, the 3 groups can be vaccinated for
+fewer than 3 months, 3-6 months and more than 6 months.
